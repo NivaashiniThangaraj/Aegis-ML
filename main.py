@@ -9,11 +9,11 @@ Integration:
 import os
 import pickle
 import asyncio
-from datetime import datetime
-
 import numpy as np
 import pandas as pd
 import asyncpg
+from datetime import datetime
+from contextlib import async_contextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,9 +22,95 @@ from dotenv import load_dotenv
 # --- 1. Environment Setup ---
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+BASE_DIR = os.path.dirname(__file__)
 
-# --- 2. App Initialization ---
-app = FastAPI(title="Aegis ML Master Pipeline", version="3.2.0")
+# --- 2. Global Model Fallbacks ---
+class DummyModel:
+    def predict(self, X): return np.array([5.0])
+    def inverse_transform(self, X): return ["MODERATE"]
+
+# Initialize global variables for models
+RISK_MODEL = RISK_LE = RISK_REGRESSOR = DummyModel()
+INCOME_REG = INCOME_CLF = INCOME_LE = DummyModel()
+FRAUD_REG = FRAUD_CLF = FRAUD_LE = DummyModel()
+db_pool = None
+
+# Feature lists matching your training sets
+RISK_FEATURES = ["temp_c", "feels_like_c", "rainfall_mm", "pm25", "pm10", "traffic_index"]
+INCOME_FEATURES = ["earnings_drop_pct", "order_drop_pct", "activity_drop_pct", "orders_last_hour", "earnings_today", "hours_worked_today", "avg_orders_7d", "avg_earnings_12w", "avg_hours_baseline"]
+FRAUD_FEATURES = ["activity_drop_pct", "hours_worked_today", "earnings_drop_pct", "active_hours", "deliveries_completed", "avg_deliveries", "movement_distance_km", "order_drop_pct", "orders_last_hour"]
+
+# --- 3. Helper Functions ---
+def _load(filename):
+    path = os.path.join(BASE_DIR, filename)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+# --- 4. Modern Lifespan Handler (Fixes Shutdown & Startup Issues) ---
+@async_contextmanager
+async def lifespan(app: FastAPI):
+    # --- STARTUP: Load Resources ---
+    global db_pool, RISK_MODEL, RISK_LE, RISK_REGRESSOR, INCOME_REG, INCOME_CLF, INCOME_LE, FRAUD_REG, FRAUD_CLF, FRAUD_LE
+    
+    # 1. Initialize Database Pool
+    try:
+        if DATABASE_URL:
+            db_pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                ssl="require"
+            )
+            print("✅ PostgreSQL Connection Pool Created")
+    except Exception as e:
+        print(f"❌ Database Pool Error: {e}")
+
+    # 2. Load ML Models
+    try:
+        print("⌛ Loading ML Models...")
+        
+        # Risk Model
+        risk_pkg = _load("risk_model.pkl")
+        if risk_pkg:
+            RISK_MODEL = risk_pkg["model"]
+            RISK_LE = risk_pkg["label_encoder"]
+            global RISK_FEATURES
+            RISK_FEATURES = risk_pkg["features"]
+        RISK_REGRESSOR = _load("risk_regressor.pkl") or DummyModel()
+
+        # Income Model
+        income_pkg = _load("income_model.pkl")
+        if income_pkg:
+            INCOME_REG = income_pkg["regressor"]
+            INCOME_CLF = income_pkg["classifier"]
+            INCOME_LE = income_pkg["label_encoder"]
+            global INCOME_FEATURES
+            INCOME_FEATURES = income_pkg["features"]
+
+        # Fraud Model
+        fraud_pkg = _load("fraud_model.pkl")
+        if fraud_pkg:
+            FRAUD_REG = fraud_pkg["regressor"]
+            FRAUD_CLF = fraud_pkg["classifier"]
+            FRAUD_LE = fraud_pkg["label_encoder"]
+            global FRAUD_FEATURES
+            FRAUD_FEATURES = fraud_pkg["features"]
+
+        print("✅ All 4 ML models loaded successfully.")
+    except Exception as e:
+        print(f"⚠️ Model Setup Warning: {e}")
+
+    yield # --- APP IS RUNNING ---
+
+    # --- SHUTDOWN: Cleanup ---
+    if db_pool:
+        await db_pool.close()
+        print("🛑 Database Pool Closed")
+
+# --- 5. App Initialization ---
+app = FastAPI(title="Aegis ML Master Pipeline", version="3.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,101 +120,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. Database Connection Pooling ---
-db_pool = None
-
-@app.on_event("startup")
-async def startup():
-    global db_pool
-    if not DATABASE_URL:
-        print("❌ DATABASE_URL is missing!")
-        return
-    try:
-        # SSL is required for Supabase/Render connections
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=10,
-            ssl="require"
-        )
-        print("✅ PostgreSQL Connection Pool Created")
-    except Exception as e:
-        print(f"❌ Database Pool Error: {e}")
-
-@app.on_event("shutdown")
-async def shutdown():
-    if db_pool:
-        await db_pool.close()
-
-# --- 4. Load ML Models (Strictly for your 4 Files) ---
-BASE_DIR = os.path.dirname(__file__)
-
-class DummyModel:
-    """Safety fallback to prevent 502/NameErrors if files are missing."""
-    def predict(self, X): return np.array([5.0])
-    def inverse_transform(self, X): return ["MODERATE"]
-
-def _load(filename):
-    path = os.path.join(BASE_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
-    return None
-
-# Initialize global model variables
-RISK_MODEL = RISK_LE = RISK_REGRESSOR = DummyModel()
-INCOME_REG = INCOME_CLF = INCOME_LE = DummyModel()
-FRAUD_REG = FRAUD_CLF = FRAUD_LE = DummyModel()
-
-# Feature lists matching your training sets
-RISK_FEATURES = ["temp_c", "feels_like_c", "rainfall_mm", "pm25", "pm10", "traffic_index"]
-INCOME_FEATURES = ["earnings_drop_pct", "order_drop_pct", "activity_drop_pct", "orders_last_hour", "earnings_today", "hours_worked_today", "avg_orders_7d", "avg_earnings_12w", "avg_hours_baseline"]
-FRAUD_FEATURES = ["activity_drop_pct", "hours_worked_today", "earnings_drop_pct", "active_hours", "deliveries_completed", "avg_deliveries", "movement_distance_km", "order_drop_pct", "orders_last_hour"]
-
-try:
-    # 1. Load Risk Model & Regressor
-    risk_pkg = _load("risk_model.pkl")
-    if risk_pkg:
-        RISK_MODEL = risk_pkg["model"]
-        RISK_LE = risk_pkg["label_encoder"]
-        RISK_FEATURES = risk_pkg["features"]
-    
-    RISK_REGRESSOR = _load("risk_regressor.pkl") or DummyModel()
-
-    # 2. Load Income Model
-    income_pkg = _load("income_model.pkl")
-    if income_pkg:
-        INCOME_REG = income_pkg["regressor"]
-        INCOME_CLF = income_pkg["classifier"]
-        INCOME_LE = income_pkg["label_encoder"]
-        INCOME_FEATURES = income_pkg["features"]
-
-    # 3. Load Fraud Model
-    fraud_pkg = _load("fraud_model.pkl")
-    if fraud_pkg:
-        FRAUD_REG = fraud_pkg["regressor"]
-        FRAUD_CLF = fraud_pkg["classifier"]
-        FRAUD_LE = fraud_pkg["label_encoder"]
-        FRAUD_FEATURES = fraud_pkg["features"]
-
-    print("✅ All 4 ML models loaded successfully.")
-except Exception as e:
-    print(f"⚠️ Model Setup Warning (Using Fallbacks): {e}")
-
-# --- 5. Data Models ---
+# --- 6. Data Models ---
 class AnalyzeRequest(BaseModel):
     lat: float
     lon: float
     worker_id: str
-    hub_data: dict # 🚀 Handed over by Node.js
+    hub_data: dict
 
-# --- 6. Core Pipeline Functions ---
+# --- 7. Core Pipeline Functions ---
 
 async def publish_auto_alert(risk_score, city, zone):
     if not db_pool: return
     async with db_pool.acquire() as conn:
         try:
-            # Check for existing active alert in the last hour
             exists = await conn.fetchval('''
                 SELECT COUNT(*) FROM disruption_alerts 
                 WHERE zone = $1 AND status = 'active' AND created_at > NOW() - INTERVAL '1 hour'
@@ -211,17 +215,15 @@ async def save_payout_record(worker_id, amount, decision):
             print(f"❌ DB Payout Record Error: {e}")
             return {"id": 0, "created_at": datetime.now()}
 
-# --- 7. Main API Endpoint ---
+# --- 8. Endpoints ---
+
 @app.post("/api/v1/analyze")
 async def analyze_pipeline(req: AnalyzeRequest):
     hub_data = req.hub_data
-    
-    # 1. ML Engine
     risk = run_risk_analysis(hub_data)
     income = run_income_analysis(hub_data)
     fraud = run_fraud_analysis(hub_data)
 
-    # 2. Decision Logic
     baseline = hub_data.get("business_impact", {}).get("historical_baseline", {})
     daily_base = baseline.get("avg_earnings_12w", 3500) / 7
     
@@ -256,12 +258,10 @@ async def analyze_pipeline(req: AnalyzeRequest):
         }
     }
 
-    # 3. Geo Info
     loc = hub_data.get("location", {})
     city = loc.get("city") or "Coimbatore"
     zone = loc.get("zone") or "Central"
 
-    # 4. Background Tasks
     await publish_auto_alert(risk["risk_score"], city, zone)
     db_rec = await save_payout_record(req.worker_id, payout_amount, decision)
 
@@ -278,6 +278,7 @@ async def analyze_pipeline(req: AnalyzeRequest):
     }
 
 @app.get("/")
+@app.head("/") # 🚀 This allows Render to ping without 405 errors
 def health():
     return {"status": "Aegis Master Pipeline v3.2 Live", "db_connected": bool(db_pool)}
 
