@@ -1,5 +1,5 @@
 """
-Aegis Master ML Pipeline - v3.2.1 (Stable Production)
+Aegis Master ML Pipeline - v3.2.2 (Stable Production)
 Integration: 
 1. Database: asyncpg Connection Pooling for Supabase.
 2. Architecture: Push-based (Node.js sends hub_data).
@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import asyncpg
 from datetime import datetime
-from contextlib import async_contextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,13 +28,12 @@ class DummyModel:
     def predict(self, X): return np.array([5.0])
     def inverse_transform(self, X): return ["MODERATE"]
 
-# Initialize global variables
+# Initialize global variables for models and features
 RISK_MODEL = RISK_LE = RISK_REGRESSOR = DummyModel()
 INCOME_REG = INCOME_CLF = INCOME_LE = DummyModel()
 FRAUD_REG = FRAUD_CLF = FRAUD_LE = DummyModel()
 db_pool = None
 
-# Default features (Matching your training sets)
 RISK_FEATURES = ["temp_c", "feels_like_c", "rainfall_mm", "pm25", "pm10", "traffic_index"]
 INCOME_FEATURES = ["earnings_drop_pct", "order_drop_pct", "activity_drop_pct", "orders_last_hour", "earnings_today", "hours_worked_today", "avg_orders_7d", "avg_earnings_12w", "avg_hours_baseline"]
 FRAUD_FEATURES = ["activity_drop_pct", "hours_worked_today", "earnings_drop_pct", "active_hours", "deliveries_completed", "avg_deliveries", "movement_distance_km", "order_drop_pct", "orders_last_hour"]
@@ -53,20 +51,30 @@ def _load(filename):
         print(f"⚠️ File not found: {path}")
     return None
 
-# --- 4. Modern Lifespan Handler (Critical for Render Boot & Cleanup) ---
-@async_contextmanager
-async def lifespan(app: FastAPI):
-    # --- STARTUP ---
+# --- 4. App Initialization ---
+app = FastAPI(title="Aegis ML Master Pipeline", version="3.2.2")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 5. Event Handlers (Startup & Shutdown) ---
+@app.on_event("startup")
+async def startup_event():
     global db_pool, RISK_MODEL, RISK_LE, RISK_REGRESSOR, INCOME_REG, INCOME_CLF, INCOME_LE, FRAUD_REG, FRAUD_CLF, FRAUD_LE
     global RISK_FEATURES, INCOME_FEATURES, FRAUD_FEATURES
 
-    # 1. Database Pool (Render needs SSL)
+    # 1. Database Pool
     try:
         if DATABASE_URL:
             db_pool = await asyncpg.create_pool(
                 DATABASE_URL, 
                 min_size=1, 
-                max_size=5, # Reduced to prevent Supabase connection limits
+                max_size=5, 
                 ssl="require"
             )
             print("✅ PostgreSQL Connection Pool Created")
@@ -100,23 +108,13 @@ async def lifespan(app: FastAPI):
         FRAUD_LE = fraud_pkg.get("label_encoder", FRAUD_LE)
         FRAUD_FEATURES = fraud_pkg.get("features", FRAUD_FEATURES)
 
-    print("✅ All ML Models & Resources Ready.")
-    yield 
-    # --- SHUTDOWN ---
+    print("✅ Startup Sequence Complete")
+
+@app.on_event("shutdown")
+async def shutdown_event():
     if db_pool:
         await db_pool.close()
         print("🛑 Database Pool Closed")
-
-# --- 5. App Setup ---
-app = FastAPI(title="Aegis ML Master Pipeline", version="3.2.1", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # --- 6. Data Models ---
 class AnalyzeRequest(BaseModel):
@@ -213,17 +211,16 @@ async def save_payout_record(worker_id, amount, decision):
             print(f"❌ DB Payout Record Error: {e}")
             return {"id": 0, "created_at": datetime.now()}
 
-# --- 8. Main API Endpoint ---
+# --- 8. Endpoints ---
+
 @app.post("/api/v1/analyze")
 async def analyze_pipeline(req: AnalyzeRequest):
     hub_data = req.hub_data
     
-    # 1. ML Engine
     risk = run_risk_analysis(hub_data)
     income = run_income_analysis(hub_data)
     fraud = run_fraud_analysis(hub_data)
 
-    # 2. Decision Logic
     baseline = hub_data.get("business_impact", {}).get("historical_baseline", {})
     daily_base = baseline.get("avg_earnings_12w", 3500) / 7
     
@@ -258,12 +255,10 @@ async def analyze_pipeline(req: AnalyzeRequest):
         }
     }
 
-    # 3. Geo Info
     loc = hub_data.get("location", {})
     city = loc.get("city") or "Coimbatore"
     zone = loc.get("zone") or "Central"
 
-    # 4. Background Tasks (Alerts and DB Storage)
     await publish_auto_alert(risk["risk_score"], city, zone)
     db_rec = await save_payout_record(req.worker_id, payout_amount, decision)
 
@@ -280,12 +275,11 @@ async def analyze_pipeline(req: AnalyzeRequest):
     }
 
 @app.get("/")
-@app.head("/") # 🚀 Allows Render's Load Balancer to check health without errors
+@app.head("/") 
 def health():
     return {
-        "status": "Aegis Master Pipeline v3.2.1 Live", 
-        "db_connected": bool(db_pool),
-        "models_ready": not isinstance(RISK_MODEL, DummyModel)
+        "status": "Aegis Master Pipeline v3.2.2 Live", 
+        "db": bool(db_pool)
     }
 
 if __name__ == "__main__":
