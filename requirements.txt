@@ -1,8 +1,8 @@
-fastapi
-uvicorn
-asyncpg
-numpy<2.0.0
-pandas<3.0.0
-pydantic
-python-dotenv
-scikit-learn
+fastapi==0.110.0
+uvicorn==0.27.1
+asyncpg==0.29.0
+numpy==1.26.4
+pandas==2.2.1
+pydantic==2.6.3
+python-dotenv==1.0.1
+scikit-learn==1.4.1.post1
